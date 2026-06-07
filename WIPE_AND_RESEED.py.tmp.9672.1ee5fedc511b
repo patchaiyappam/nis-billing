@@ -1,0 +1,489 @@
+"""
+WIPE_AND_RESEED.py - Reset local DB with real customer + product lists.
+=======================================================================
+
+What it does (in order):
+
+1. BACKUPS the live SQLite to:
+     ~/Documents/NEW_INDIAN_STEEL/backups/billing.db.backup-pre-reseed-<ts>
+2. WIPES local tables: invoice_items, invoices, payments, pending_syncs,
+   background_tasks, customers, products.
+3. RESEEDS:
+     - 79 real customers (with opening_balance = current Khatabook due)
+     - 1 of those (Jj Traders) has a Cr balance; we insert a "carry-over"
+       payment row so get_computed_due returns the correct negative due
+       (i.e. WE owe them).
+     - 197 real products (id+name+price exactly as listed).
+4. PRINTS a summary so you can sanity-check before launching the app.
+
+This script does NOT touch Supabase. Cloud cleanup runs separately
+through the MCP, and the next app start will auto-sync the fresh data.
+
+Usage on your laptop / shop PC:
+
+    python WIPE_AND_RESEED.py
+
+You will be asked to type RESEED before anything is wiped. The backup
+created in step 1 lets you restore if anything looks wrong:
+
+    Copy backups\billing.db.backup-pre-reseed-<ts>  ->  billing.db
+"""
+from __future__ import annotations
+
+import os
+import sys
+import shutil
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+
+# ============================================================
+# Real customer list (Khatabook export, 15 May 2026)
+# Each row: (name, phone, opening_balance_dr_amount)
+# Cr balance for Jj Traders is handled separately as a payment row.
+# ============================================================
+
+CUSTOMERS = [
+    ("Vetri Seruvai Velting",         "9944020898", 61545.00),
+    ("Elango",                         "9655772030", 49735.00),
+    ("Er.kannathasan",                 "9688776342", 48532.00),
+    ("Radhakrishnan Contractor",       "9786057759", 43146.00),
+    ("Karthi velting Tcbm",            "9176065355", 42231.00),
+    ("Panneerselvam Contractors",      "9443128620", 40428.00),
+    ("mogan son",                      "7639937939", 40014.00),
+    ("Kishore Manamudi Auto",          "8667880788", 38712.00),
+    ("Karikalan Rk Constructions",     "9585684063", 31700.00),
+    ("Natimuthu Canrecter",            "9943755084", 29096.00),
+    ("Dr.Stalin Tcbm",                 "9677344821", 27080.00),
+    ("Er Ramamoorthi",                 "7708540720", 26250.00),
+    ("Mathi Appa Kolaikkatu",          "7358475302", 25298.00),
+    ("Sakthivel Contrect",             "7339556806", 23218.00),
+    ("Jana Velting",                   "6383565127", 22000.00),
+    ("Maniyan Steel",                  "9715037108", 21933.00),
+    ("Divya MKP",                      "6382655245", 20418.00),
+    ("Er. China Mani",                 "9944144568", 20190.00),
+    ("Er.Varatharajan",                "7339605009", 19691.00),
+    ("Mukkottukollai Alakar Arumuham", "9751488173", 17006.00),
+    ("Er .Manikandan B",               "8122674768", 16207.00),
+    ("Kumar Kurmpivayal",              "8838608033", 15500.00),
+    ("Er. Lakshmanan",                 "9600045520", 15000.00),
+    ("Parthiban Welder",               "9344986683", 14197.00),
+    ("Kannan Velting",                 "9942087423", 13504.00),
+    ("Pal Punalvasal",                 "9047187656", 13044.00),
+    ("AAA Welding",                    "9080133545", 13042.00),
+    ("Nagamuthu",                      "9791468094", 12430.00),
+    ("Suthagar Contracter",            "7812828343", 12372.00),
+    ("Mokan Thalaivar Tcbm",           "9042567353", 11701.00),
+    ("Er. Linfo Construction",         "8667836711", 11439.00),
+    ("Yovan",                          "9788861159",  9740.00),
+    ("Palanivel",                      "9043490806",  9580.00),
+    ("Rajenthiran Kvr",                "9047377281",  9381.00),
+    ("E B Murugesan",                  "8270659214",  9118.00),
+    ("Nagoor Andavar Tcbm",            "8940853649",  8769.00),
+    ("Nathan Welding",                 "8220080082",  8086.00),
+    ("Raja kurupivayal",               "9087354583",  7901.00),
+    ("Karthi kalathoor",               "8675409174",  7705.00),
+    ("Jeyaprakash",                    "9176391170",  7625.00),
+    ("Saravanan",                      "9787656243",  7222.00),
+    ("Nvs Tcbm",                       "9884000406",  6958.00),
+    ("Alagar (kurumpivayal)",          "9942173372",  6019.00),
+    ("Madasamy",                       "9842161886",  5742.00),
+    ("Er. Mohamed Shrek Avanam",       "8940425272",  5580.00),
+    ("Mahendran Contrecter",           "8248266871",  5558.00),
+    ("Manikandan",                     "8807344243",  4720.00),
+    ("Vicky Contactor",                "9500571794",  4712.00),
+    ("Kalathoor",                      "8015360927",  4681.00),
+    ("Sesu Raj 2",                     "8681983713",  4648.00),
+    ("Cinnu Flux",                     "9566469652",  4616.00),
+    ("Dakshinamoorthy Neduvai",        "9443265142",  4558.00),
+    ("Kavi Anna Palanimurugan",        "9500452089",  4312.00),
+    ("Pabu Anavayal",                  "9443751984",  4087.00),
+    ("Maheshwari Flower Tcbm",         "9629572569",  3596.00),
+    ("Saravanan Halo Block",           "8220077587",  3544.00),
+    ("Er.Laksmikanthan",               "9360706034",  3542.00),
+    ("Vinayaga Computer",              "9790455895",  3370.00),
+    ("Karthik Velting Kuruchi",        "9080828451",  3337.00),
+    ("Pothi kurumbivayal",             "9524247297",  3202.00),
+    ("Baskar",                         "9047187641",  3000.00),
+    ("Kumar T.C.B.M",                  "9751850234",  3000.00),
+    ("senthil karukkakuruchi",         "7010583500",  2912.00),
+    ("Ayyappan Ayyappan",              "9750814320",  2566.00),
+    ("Ayya Durai Karukka Kuruchi",     "7448585684",  2425.00),
+    ("Kumar welding",                  "6381940407",  2406.00),
+    ("Dinesh Amman Block",             "9789667972",  2402.00),
+    ("Abdulla",                        "9965183640",  2365.00),
+    ("Bala Krishnan Welding",          "8072362600",  2336.00),
+    ("Senthil(auto)",                  "7094811061",  1863.00),
+    ("Vinoth Welding",                 "8524012341",  1704.00),
+    ("Amman Welding",                  "9095346019",  1411.00),
+    ("Kamaraj Contractor",             "7200118288",  1393.00),
+    ("Ramesh nallandarkkollai",        "9677509185",  1000.00),
+    ("Raju Mesthiri",                  "9944926092",   696.00),
+    ("Apnathan",                       "8056551763",   444.00),
+    ("Thangam Palporul Angadi",        "9626428176",   280.00),
+    ("Selvaraj Kalathoor",             "9003321220",     3.00),
+    # Cr (we owe them) - opening_balance=0, balance handled via payment row
+    ("Jj Traders",                     "9655961034",     0.00),
+]
+
+# Customer with Cr balance: we insert a "carry-over" payment so the
+# running due computes as negative (we owe them).
+CR_CARRYOVER = [
+    {"phone": "9655961034", "amount": 28850.00, "note": "Khatabook carry-over (Cr)"},
+]
+
+# ============================================================
+# Real product list (197 products, exact names and prices)
+# ============================================================
+PRODUCTS = [
+    ('KING 4"cutting wheel', 15.00),
+    ('KING 4"grinding wheel', 30.00),
+    ('KING 4"flappin disk', 35.00),
+    ('KING 5"cutting wheel', 35.00),
+    ('KING 5"cranting wheel', 50.00),
+    ('KING 14"cutting wheel', 150.00),
+    ('YURI 4"cutting wheel', 15.00),
+    ('YURI 4"grinding wheel', 35.00),
+    ('YURI 5"cutting wheel', 30.00),
+    ('YURI 14"cutting wheel', 140.00),
+    ('SPEED 4"wall cutter', 140.00),
+    ('SPEED 5"wall cutter', 180.00),
+    ('SPEED 4"wood cutter', 190.00),
+    ('SPEED 5"wood cutter', 260.00),
+    ('SPEED 3/4" SGROW', 3.00),
+    ('SPEED 1"SGROW', 3.50),
+    ('SPEED 1 1/2" SGROW', 5.00),
+    ('SPEED 2"SGROW', 6.50),
+    ('SPEED 2 1/2 SGROW', 8.00),
+    ('SPEED 3" SGROW', 9.00),
+    ('SPEED 3/4" STAR SGROW', 1.50),
+    ('SPEED 1"STAR SGROW', 2.00),
+    ('SPEED 1 1/2"STAR SGROW', 3.00),
+    ('SPEED 3"STAR SGROW', 5.00),
+    ('SPEED SGROW BIT', 30.00),
+    ('STAR BIT', 40.00),
+    ('2"NAILS', 100.00),
+    ('2 1/2" NAILS', 100.00),
+    ('3" NAILS', 100.00),
+    ('4"NAILS', 100.00),
+    ('5"NAILS', 100.00),
+    ('Concrete Nails', 200.00),
+    ('1ltr PAINT', 350.00),
+    ('1ltr YELLOW PRIMER', 300.00),
+    ('1ltr RED OXIDE', 250.00),
+    ('1/2ltr PAINT', 180.00),
+    ('1/2ltr YELLOW PRIMER', 150.00),
+    ('1/2ltr RED OXIDE', 130.00),
+    ('TINNER 1/2ltr', 50.00),
+    ('TINNER 1ltr', 100.00),
+    ('TINNER 2ltr', 200.00),
+    ('2"PRUSH', 40.00),
+    ('4" ROLLING PRUSH', 140.00),
+    ('3FT GREEN MESS', 12.00),
+    ('4FT GREEN MESS', 12.00),
+    ('5FT GREEN MESS', 12.00),
+    ('SILICON', 180.00),
+    ('SILICON GUN', 170.00),
+    ('8MM LIVER', 90.00),
+    ('10MM LIVER', 130.00),
+    ('12MM LIVER', 150.00),
+    ('16MM LIVER', 220.00),
+    ('8MM BIN PLATE', 70.00),
+    ('10MM BIN PLATE', 90.00),
+    ('12MM BIN PLATE', 95.00),
+    ('16MM BIN PLATE', 125.00),
+    ('3/4"O KEEL', 40.00),
+    ('1"O KEEL', 60.00),
+    ('1 1/4"O KEEL', 90.00),
+    ('1 1/2"O KEEL', 130.00),
+    ('1"SQ KEEL', 100.00),
+    ('1 1/4"SQ KEEL', 150.00),
+    ('1 1/2" SQ KEEL', 200.00),
+    ('ALL PLATE', 100.00),
+    ('TAMMI', 10.00),
+    ('O TAMMI', 20.00),
+    ('1KELD PIECE', 120.00),
+    ('J BOLD', 140.00),
+    ('BANTHAVALAIYAM', 120.00),
+    ('PLASTIC WASSER', 50.00),
+    ('1 1/2"LORRY KELL', 30.00),
+    ('2" LORRY KELL', 40.00),
+    ('SURULI KEEL', 120.00),
+    ('SINGLE BALL', 17.00),
+    ('DOUBLE BALL', 32.00),
+    ('12MM PUSS', 10.00),
+    ('16MM PUSH', 10.00),
+    ('NUT W1/4', 150.00),
+    ('DIAMOND', 130.00),
+    ('VELL', 130.00),
+    ('2 1/2"SUN FLOWER', 150.00),
+    ('6" SUNFLOWER', 150.00),
+    ('HANDLEN (SMALL)', 60.00),
+    ('HANDLE (medium)', 70.00),
+    ('DHANDLE(big)', 80.00),
+    ('SUTHU KEEL(SMALL)', 120.00),
+    ('SUTHU KEEL(BIG)', 140.00),
+    ('glass', 50.00),
+    ('SPEED ROLLING WHEEL', 210.00),
+    ('1 1/2" T BALL(Round)', 80.00),
+    ('2" T BALL (Round)', 90.00),
+    ('NELLAKLAMPU(gold)', 120.00),
+    ('5FT SADE NET', 350.00),
+    ('10FT SADE NET', 350.00),
+    ('SMALL POUNT', 80.00),
+    ('POUND(O.900)', 110.00),
+    ('POUND(1.100)', 110.00),
+    ('POUND(1.600)', 110.00),
+    ('POUND(2.000)', 110.00),
+    ('2FT MANVETTI', 280.00),
+    ('NIAL WASHER', 150.00),
+    ('BOLD FT 1.5*3/8', 150.00),
+    ('GI NET', 180.00),
+    ('5MTR DAPE', 100.00),
+    ('7.5MTR DAPE', 200.00),
+    ('7.5MTR DAPE IKON', 240.00),
+    ('15MTR DAPE', 170.00),
+    ('30MTR TAPE', 270.00),
+    ('welding holder(small)', 150.00),
+    ('welding holder(big)', 220.00),
+    ('16mm armer bit', 130.00),
+    ('14mm armer bit', 120.00),
+    ('10mm armer bit', 80.00),
+    ('8mm armer bit', 70.00),
+    ('12mm metal bit', 580.00),
+    ('10mm metal bit', 400.00),
+    ('8mm metal bit', 250.00),
+    ('6mm metal bit', 150.00),
+    ('1½" T ball', 70.00),
+    ('2" T ball', 90.00),
+    ('2½" T ball', 100.00),
+    ('1½".sq T ball', 70.00),
+    ('5FT Shade Net(50%)', 1050.00),
+    ('10FT Shade Net(50%)', 2100.00),
+    ('5FT Shade Net(75%)', 2000.00),
+    ('10FT Shade Net(75%)', 3500.00),
+    ('12MM Taver bold', 120.00),
+    ('16MM Taver bold', 140.00),
+    ('12MM THAPPA', 80.00),
+    ('12MM THAPPA SET', 120.00),
+    ('16MM THAPPA SET', 140.00),
+    ('3FT Weld mess', 22.00),
+    ('4FT Weld mess', 22.00),
+    ('5FT Weld mess', 22.00),
+    ('JSW 0.20MM 8FT GC SHEET', 500.00),
+    ('JSW 0.20MM 10FT GC SHEET', 600.00),
+    ('JSW 0.20MM 12FT GC SHEET', 700.00),
+    ('JSW 0.25MM 8FT GC SHEET', 600.00),
+    ('JSW 0.25MM 10FT GC SHEET', 700.00),
+    ('JSW 0.25MM 12FT GC SHEET', 800.00),
+    ('JSW 0.30MM 8FT GC SHEET', 700.00),
+    ('JSW 0.30MM 10FT GC SHEET', 800.00),
+    ('JSW 0.30MM 12FT GC SHEET', 900.00),
+    ('6ft COLOUR SHEET TATA', 1200.00),
+    ('9ft COLOUR SHEET TATA', 1800.00),
+    ('10ft COLOUR SHEET TATA', 2000.00),
+    ('11ft COLOUR SHEET TATA', 2200.00),
+    ('12ft COLOUR SHEET TATA', 2400.00),
+    ('14ft COLOUR SHEET TATA', 2800.00),
+    ('15ft COLOUR SHEET TATA', 3000.00),
+    ('16ft COLOUR SHEET TATA', 3200.00),
+    ('17ft COLOUR SHEET TATA', 3400.00),
+    ('18ft COLOUR SHEET TATA', 3600.00),
+    ('19ft COLOUR SHEET TATA', 3800.00),
+    ('20ft COLOUR SHEET TATA', 4000.00),
+    ('21ft COLOUR SHEET TATA', 4200.00),
+    ('22ft COLOUR SHEET TATA', 4400.00),
+    ('23ft COLOUR SHEET TATA', 4600.00),
+    ('24ft COLOUR SHEET TATA', 4800.00),
+    ('6ft PENTCOLOUR SHEET TATA', 1260.00),
+    ('8ft PENTCOLOUR SHEET TATA', 1680.00),
+    ('10ft PENTCOLOUR SHEET TATA', 2100.00),
+    ('12ft PENTCOLOUR SHEET TATA', 2520.00),
+    ('14ft PENTCOLOUR SHEET TATA', 2940.00),
+    ('16ft PENTCOLOUR SHEET TATA', 3360.00),
+    ('18ft PENTCOLOUR SHEET TATA', 3780.00),
+    ('20ft PENTCOLOUR SHEET TATA', 4200.00),
+    ('22ft PENTCOLOUR SHEET TATA', 4620.00),
+    ('24ft PENTCOLOUR SHEET TATA', 5040.00),
+    ('10ft RIDGE SHEET TATA', 1500.00),
+    ('6ft COLOUR SHEET JSW', 960.00),
+    ('9ft COLOUR SHEET JSW', 1440.00),
+    ('10ft COLOUR SHEET JSW', 1600.00),
+    ('11ft COLOUR SHEET JSW', 1760.00),
+    ('12ft COLOUR SHEET JSW', 1920.00),
+    ('14ft COLOUR SHEET JSW', 2240.00),
+    ('15ft COLOUR SHEET JSW', 2400.00),
+    ('16ft COLOUR SHEET JSW', 2560.00),
+    ('17ft COLOUR SHEET JSW', 2720.00),
+    ('18ft COLOUR SHEET JSW', 2880.00),
+    ('19ft COLOUR SHEET JSW', 3040.00),
+    ('20ft COLOUR SHEET JSW', 3200.00),
+    ('21ft COLOUR SHEET JSW', 3360.00),
+    ('22ft COLOUR SHEET JSW', 3520.00),
+    ('23ft COLOUR SHEET JSW', 3680.00),
+    ('24ft COLOUR SHEET JSW', 3840.00),
+    ('6ft PENTCOLOUR SHEET JSW', 1020.00),
+    ('8ft PENTCOLOUR SHEET JSW', 1360.00),
+    ('10ft PENTCOLOUR SHEET JSW', 1700.00),
+    ('12ft PENTCOLOUR SHEET JSW', 2040.00),
+    ('14ft PENTCOLOUR SHEET JSW', 2380.00),
+    ('16ft PENTCOLOUR SHEET JSW', 2720.00),
+    ('18ft PENTCOLOUR SHEET JSW', 3060.00),
+    ('20ft PENTCOLOUR SHEET JSW', 3400.00),
+    ('22ft PENTCOLOUR SHEET JSW', 3740.00),
+    ('24ft PENTCOLOUR SHEET JSW', 4080.00),
+    ('8ft RIDGE SHEETJSW', 800.00),
+]
+
+
+def main():
+    base    = Path.home() / "Documents" / "NEW_INDIAN_STEEL"
+    db_path = base / "billing.db"
+    backups = base / "backups"
+    backups.mkdir(parents=True, exist_ok=True)
+
+    if not db_path.exists():
+        print(f"ERROR: live DB not found at {db_path}")
+        return 1
+
+    # ---- Initialize schema (in case migrations haven't run yet) ----
+    # Touch config and run init + migrations so the DB is up to date.
+    import config
+    config.DB_PATH = str(db_path)
+    from database import init_database
+    from migrations import run_migrations
+    init_database()
+    run_migrations()
+
+    # ---- Confirmation prompt ----
+    print()
+    print("=" * 70)
+    print("  WIPE AND RESEED — local SQLite database")
+    print("=" * 70)
+    print(f"  DB path: {db_path}")
+    print(f"  About to delete ALL invoices, invoice_items, payments,")
+    print(f"  pending_syncs, background_tasks, customers, products,")
+    print(f"  then reseed with {len(CUSTOMERS)} customers and {len(PRODUCTS)} products.")
+    print()
+    ans = input("  Type RESEED to continue (anything else cancels): ").strip()
+    if ans != "RESEED":
+        print("  Cancelled. Nothing was changed.")
+        return 0
+
+    # ---- Backup ----
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backups / f"billing.db.backup-pre-reseed-{ts}"
+    shutil.copy2(db_path, backup_path)
+    print(f"\n  Backup written to: {backup_path}")
+
+    # Also copy WAL/SHM if present
+    for ext in ("-wal", "-shm"):
+        side = db_path.with_suffix(db_path.suffix + ext)
+        if side.exists():
+            shutil.copy2(side, backup_path.with_suffix(backup_path.suffix + ext))
+
+    # ---- Wipe and reseed in one transaction ----
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        c = conn.cursor()
+
+        for tbl in (
+            "invoice_items",
+            "invoices",
+            "payments",
+            "pending_syncs",
+            "background_tasks",
+            "customers",
+            "products",
+        ):
+            try:
+                n = c.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            except sqlite3.OperationalError:
+                n = "n/a"
+            c.execute(f"DELETE FROM {tbl}")
+            print(f"  WIPED  {tbl:18s} (was {n} rows)")
+
+        # Reset auto-increment counters where present
+        c.execute(
+            "DELETE FROM sqlite_sequence WHERE name IN "
+            "('invoice_items','invoices','payments','pending_syncs',"
+            "'background_tasks','customers','products')"
+        )
+
+        # Insert customers
+        for name, phone, ob in CUSTOMERS:
+            c.execute(
+                "INSERT INTO customers (name, phone, opening_balance, total_due, address) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, phone, float(ob), float(ob), ""),
+            )
+        print(f"  SEEDED {len(CUSTOMERS)} customers")
+
+        # Insert Cr carry-over as a payment for Jj Traders
+        # (negates the 0 opening balance to make total_due correctly negative)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for cr in CR_CARRYOVER:
+            c.execute(
+                "INSERT INTO payments (customer_phone, amount, date) "
+                "VALUES (?, ?, ?)",
+                (cr["phone"], float(cr["amount"]), now),
+            )
+            # total_due also needs the negative adjustment
+            c.execute(
+                "UPDATE customers SET total_due = total_due - ? WHERE phone = ?",
+                (float(cr["amount"]), cr["phone"]),
+            )
+            print(f"  CR carry-over: {cr['phone']} -₹{cr['amount']:.2f}  ({cr['note']})")
+
+        # Insert products in source order so IDs map to the printed list
+        for name, price in PRODUCTS:
+            c.execute(
+                "INSERT INTO products (name, price) VALUES (?, ?)",
+                (name, float(price)),
+            )
+        print(f"  SEEDED {len(PRODUCTS)} products")
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"\n  ERROR during reseed: {e}")
+        print(f"  Rolled back. Restore from backup if needed:")
+        print(f"    copy \"{backup_path}\" \"{db_path}\"")
+        return 2
+    finally:
+        conn.close()
+
+    # ---- Summary ----
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    print()
+    print("=" * 70)
+    print("  POST-RESEED SUMMARY")
+    print("=" * 70)
+    n_cust = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+    n_prod = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    n_inv  = conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0]
+    n_pay  = conn.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
+    tot_due = conn.execute("SELECT COALESCE(SUM(total_due),0) FROM customers").fetchone()[0]
+    print(f"  customers: {n_cust}")
+    print(f"  products : {n_prod}")
+    print(f"  invoices : {n_inv}  (should be 0)")
+    print(f"  payments : {n_pay}  (1 = Jj Traders Cr carry-over)")
+    print(f"  total of customer total_due: Rs {tot_due:,.2f}")
+    print(f"  expected from Khatabook    : Rs 971,924.00  (Dr 1,000,774 - Cr 28,850)")
+    conn.close()
+
+    print()
+    print("  Done. Start the app (Shop Mode or Admin Mode) - on first launch")
+    print("  the background sync will push the fresh data to Supabase.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

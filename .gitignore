@@ -1,0 +1,26 @@
+# Database & user data — synced via Supabase, NOT via Git
+*.db
+*.db-wal
+*.db-shm
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local backups & exports
+backups/
+exports/
+invoices/
+logs/
+
+# Cloud pull state (machine-specific)
+cloud_pull_state.json
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# VS Code / IDE
+.vscode/
+.idea/

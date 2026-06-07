@@ -1,0 +1,14 @@
+# Core
+reportlab>=4.0.0
+openpyxl>=3.1.0
+pyinstaller>=6.0.0
+
+# Cloud sync (optional — app works 100% offline without these)
+supabase>=2.0.0
+
+# WhatsApp automation (optional — falls back to wa.me link without these)
+pywhatkit>=5.4
+pyautogui>=0.9.54
+
+# PDF-to-image for WhatsApp sharing (optional — enables JPG invoice images)
+pymupdf>=1.23.0
