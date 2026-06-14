@@ -45,6 +45,25 @@ _auto_sync_timer  = None
 _auto_sync_running = False
 
 _QUEUE_MAX_RETRIES = 5
+_sync_all_runs = 0   # full-sync counter (throttles bulk product pushes)
+
+
+def _force_http1():
+    """Force httpx (the Supabase client) onto HTTP/1.1. Supabase behind
+    Cloudflare breaks on HTTP/2 here (ConnectionTerminated / 'pseudo-header in
+    trailer'), which stalls all syncing."""
+    try:
+        import httpx
+        if getattr(httpx.Client, "_nis_http1", False):
+            return
+        _orig = httpx.Client.__init__
+        def _init(self, *a, **kw):
+            kw["http2"] = False
+            return _orig(self, *a, **kw)
+        httpx.Client.__init__ = _init
+        httpx.Client._nis_http1 = True
+    except Exception:
+        pass
 
 # ── Module-level Supabase client ─────────────────────────
 _client = None      # Supabase client or None
@@ -71,6 +90,7 @@ def _get_client():
             _client = False
             return None
 
+        _force_http1()
         from supabase import create_client  # type: ignore[import]
         _client = create_client(SUPABASE_URL, SUPABASE_KEY)
         _ready  = True
@@ -340,11 +360,16 @@ def sync_all() -> None:
             # ── Products ──────────────────────────────────────
             # Push in small batches with a short sleep to avoid
             # hitting Supabase's 100-stream HTTP/2 connection limit.
-            products = get_all_products()
-            for i, p in enumerate(products):
-                sync_product(dict(p))
-                if i % 20 == 19:       # pause every 20 rows
-                    _time.sleep(0.3)
+            # Products rarely change and are the bulk of the traffic — push
+            # them only every ~10th cycle to avoid flooding Supabase.
+            global _sync_all_runs
+            _sync_all_runs += 1
+            if _sync_all_runs % 10 == 1:
+                products = get_all_products()
+                for i, p in enumerate(products):
+                    sync_product(dict(p))
+                    if i % 20 == 19:
+                        _time.sleep(0.5)
 
             customers = get_all_customers()
             name_by_phone = {c["phone"]: c.get("name", "") for c in customers}

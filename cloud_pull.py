@@ -76,6 +76,22 @@ _client = None
 _ready  = False
 
 
+def _force_http1():
+    """Force httpx onto HTTP/1.1 (Supabase + Cloudflare HTTP/2 = sync errors)."""
+    try:
+        import httpx
+        if getattr(httpx.Client, "_nis_http1", False):
+            return
+        _orig = httpx.Client.__init__
+        def _init(self, *a, **kw):
+            kw["http2"] = False
+            return _orig(self, *a, **kw)
+        httpx.Client.__init__ = _init
+        httpx.Client._nis_http1 = True
+    except Exception:
+        pass
+
+
 def _get_client():
     """Reuse the same Supabase client supabase_sync uses."""
     global _client, _ready
@@ -89,6 +105,7 @@ def _get_client():
             log.info("cloud_pull: SUPABASE_URL/KEY not set — pull disabled.")
             _client = False
             return None
+        _force_http1()
         from supabase import create_client
         _client = create_client(SUPABASE_URL, SUPABASE_KEY)
         _ready  = True

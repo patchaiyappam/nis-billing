@@ -1091,6 +1091,14 @@ def queue_sync_operation(operation, payload):
     with _write_lock:
         conn = get_conn()
         try:
+            # Self-heal: drop dead entries (retries exhausted) and cap the queue
+            # so a long outage can't explode it into tens of thousands of rows.
+            conn.execute("DELETE FROM pending_syncs WHERE retry_count >= 5")
+            qn = conn.execute("SELECT COUNT(*) FROM pending_syncs").fetchone()[0]
+            if qn >= 3000:
+                conn.commit()
+                log.warning("Sync queue full (%d) — skipping new '%s' to avoid flood.", qn, operation)
+                return None
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cur = conn.execute(
                 "INSERT INTO pending_syncs (operation, payload, retry_count, created_at) "
@@ -1109,14 +1117,15 @@ def queue_sync_operation(operation, payload):
             conn.close()
 
 
-def get_pending_syncs(max_retries=5):
+def get_pending_syncs(max_retries=5, limit=100):
     """
-    Return all pending sync queue items that have not exceeded max_retries.
-    Returns list of dicts with keys: id, operation, payload, retry_count, created_at.
+    Return up to `limit` pending sync items that haven't exceeded max_retries.
+    Limiting the batch prevents a huge backlog from flooding Supabase at once.
     """
     rows = _execute_read(
-        "SELECT * FROM pending_syncs WHERE retry_count < ? ORDER BY created_at ASC",
-        (max_retries,)
+        "SELECT * FROM pending_syncs WHERE retry_count < ? "
+        "ORDER BY created_at ASC LIMIT ?",
+        (max_retries, limit)
     )
     return [dict(r) for r in rows]
 
