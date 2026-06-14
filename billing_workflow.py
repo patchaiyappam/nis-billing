@@ -138,6 +138,16 @@ def _step_open_pdf(pdf_path: str) -> None:
         log.debug("Open PDF skipped: %s", e)
 
 
+def _whatsapp_auto_send_ok() -> bool:
+    """Auto-send WhatsApp only when it won't disrupt billing: needs
+    WA_AUTO_SEND=True AND a silent method (Meta/Twilio). "wame" steals focus."""
+    try:
+        from config import WA_AUTO_SEND, WA_METHOD  # type: ignore[import]
+        return bool(WA_AUTO_SEND) and str(WA_METHOD).lower() in ("meta", "twilio")
+    except Exception:
+        return False
+
+
 def _step_upload_and_whatsapp(
     pdf_path: str,
     invoice_id: int,
@@ -170,23 +180,26 @@ def _step_upload_and_whatsapp(
     else:
         log.warning("STEP 4: PDF missing — upload skipped: %s", pdf_path)
 
-    # ── STEPS 6-10: Queue WhatsApp send ──────────────────
-    add_task("whatsapp_send", {
-        "phone":          phone,
-        "customer_name":  name,
-        "invoice_id":     invoice_id,
-        "total":          total,
-        "paid":           paid,
-        "balance":        balance,
-        "old_balance":    old_balance,
-        "bill_type":      bill_type,
-        "pdf_url":        "",             # will be filled after upload completes
-        "pdf_path":       pdf_path or "", # for local image sending
-        "reference_name": reference_name or "",
-        "reference_phone":reference_phone or "",
-        "payment_type":   payment_type or "Cash",
-    })
-    log.info("STEPS 6-10: whatsapp_send task queued for INV-%d", invoice_id)
+    # ── STEPS 6-10: Queue WhatsApp send (only if non-disruptive) ──
+    if _whatsapp_auto_send_ok():
+        add_task("whatsapp_send", {
+            "phone":          phone,
+            "customer_name":  name,
+            "invoice_id":     invoice_id,
+            "total":          total,
+            "paid":           paid,
+            "balance":        balance,
+            "old_balance":    old_balance,
+            "bill_type":      bill_type,
+            "pdf_url":        "",             # will be filled after upload completes
+            "pdf_path":       pdf_path or "", # for local image sending
+            "reference_name": reference_name or "",
+            "reference_phone":reference_phone or "",
+            "payment_type":   payment_type or "Cash",
+        })
+        log.info("STEPS 6-10: whatsapp_send task queued for INV-%d", invoice_id)
+    else:
+        log.info("WhatsApp auto-send disabled — billing left undisturbed (INV-%d).", invoice_id)
 
     # ── Supabase DB sync ─────────────────────────────────
     add_task("cloud_sync", {

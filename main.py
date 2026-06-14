@@ -58,6 +58,14 @@ def main():
     except Exception as e:
         log.error("Background tasks init failed (non-fatal): %s", e, exc_info=True)
 
+    # One-time resync after the cloud_id upgrade: pulls in bills the OLD code
+    # dropped (phone UUIDs / device-tagged ids from an updated PC).
+    try:
+        from cloud_pull import force_full_repull_once
+        force_full_repull_once()
+    except Exception as e:
+        log.info("One-time resync skipped (non-fatal): %s", e)
+
     # ── Start background task worker ─────────────────────
     try:
         from task_queue import start_task_worker

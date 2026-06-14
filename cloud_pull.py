@@ -128,6 +128,27 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def force_full_repull_once(tag: str = "v17_cloudid") -> None:
+    """One-time self-heal after the cloud_id upgrade. The OLD pull code
+    silently dropped bills whose id was not a plain number (phone UUIDs and
+    device-tagged ids) yet still advanced its bookmark past them. Reset the
+    pull bookmark ONCE so the new code re-reads every cloud row and ingests
+    the previously-dropped bills. A sentinel file makes it run only once."""
+    try:
+        from config import BASE_DIR
+        sentinel = Path(BASE_DIR) / f".resync_done_{tag}"
+        if sentinel.exists():
+            return
+        sp = _state_path()
+        if sp.exists():
+            sp.unlink()
+            log.info("cloud_pull: pull bookmark reset for one-time full re-pull (%s).", tag)
+        sentinel.write_text(_now_iso())
+        log.info("cloud_pull: one-time resync armed (%s).", tag)
+    except Exception as e:
+        log.warning("cloud_pull: force_full_repull_once failed: %s", e)
+
+
 # ════════════════════════════════════════════════════════════
 # LOCAL UPSERT HELPERS
 # ════════════════════════════════════════════════════════════
@@ -177,11 +198,12 @@ def _has_column(conn, table: str, column: str) -> bool:
 
 
 def _upsert_invoice(row: dict) -> None:
-    """Insert or update a single invoice row from cloud."""
+    """Insert/update an invoice from cloud, keyed on the global text cloud_id.
+    Bills from the other PC or the phone are inserted with a FRESH local id and
+    their cloud_id remembered — never dropped or overwriting a local bill."""
     from database import get_conn, _write_lock
-    try:
-        invoice_id = int(row.get("id"))
-    except (TypeError, ValueError):
+    cloud_id = str(row.get("id") or "").strip()
+    if not cloud_id:
         return
     updated_at      = row.get("updated_at") or _now_iso()
     customer_phone  = row.get("customer_phone") or ""
@@ -198,57 +220,52 @@ def _upsert_invoice(row: dict) -> None:
         try:
             has_ua  = _has_column(conn, "invoices", "updated_at")
             has_ref = _has_column(conn, "invoices", "reference_phone")
+            has_cid = _has_column(conn, "invoices", "cloud_id")
 
-            if has_ua:
+            existing = None
+            if has_cid:
                 existing = conn.execute(
-                    "SELECT updated_at FROM invoices WHERE id=?", (invoice_id,)
+                    "SELECT id, updated_at FROM invoices WHERE cloud_id=?",
+                    (cloud_id,),
                 ).fetchone()
-            else:
+            if existing is None and cloud_id.isdigit():
                 existing = conn.execute(
-                    "SELECT id FROM invoices WHERE id=?", (invoice_id,)
+                    "SELECT id, updated_at FROM invoices WHERE id=?",
+                    (int(cloud_id),),
                 ).fetchone()
-
-            def _ref_cols():
-                return (", reference_phone" if has_ref else "")
-            def _ref_vals():
-                return ((reference_phone,) if has_ref else ())
 
             if existing is None:
+                cols = ["customer_phone", "date", "total", "paid",
+                        "balance", "type", "pdf_url"]
+                vals = [customer_phone, date, total, paid, balance, inv_type, pdf_url]
                 if has_ua:
-                    conn.execute(
-                        "INSERT INTO invoices (id, customer_phone, date, total, paid, "
-                        f"balance, type, pdf_url, updated_at{_ref_cols()}) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{', ?' if has_ref else ''})",
-                        (invoice_id, customer_phone, date, total, paid,
-                         balance, inv_type, pdf_url, updated_at) + _ref_vals(),
-                    )
-                else:
-                    conn.execute(
-                        "INSERT INTO invoices (id, customer_phone, date, total, paid, "
-                        f"balance, type, pdf_url{_ref_cols()}) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?{', ?' if has_ref else ''})",
-                        (invoice_id, customer_phone, date, total, paid,
-                         balance, inv_type, pdf_url) + _ref_vals(),
-                    )
+                    cols.append("updated_at"); vals.append(updated_at)
+                if has_ref:
+                    cols.append("reference_phone"); vals.append(reference_phone)
+                if has_cid:
+                    cols.append("cloud_id"); vals.append(cloud_id)
+                ph = ", ".join("?" * len(cols))
+                conn.execute(
+                    f"INSERT INTO invoices ({', '.join(cols)}) VALUES ({ph})",
+                    tuple(vals),
+                )
             else:
-                local_ua = existing["updated_at"] if has_ua else ""
-                if (local_ua or "") < updated_at:
+                local_ua = (existing["updated_at"] if has_ua else "") or ""
+                if local_ua < updated_at:
+                    sets = ["customer_phone=?", "date=?", "total=?", "paid=?",
+                            "balance=?", "type=?", "pdf_url=?"]
+                    vals = [customer_phone, date, total, paid, balance, inv_type, pdf_url]
                     if has_ua:
-                        conn.execute(
-                            "UPDATE invoices SET customer_phone=?, date=?, total=?, "
-                            f"paid=?, balance=?, type=?, pdf_url=?, updated_at=?"
-                            f"{', reference_phone=?' if has_ref else ''} WHERE id=?",
-                            (customer_phone, date, total, paid, balance,
-                             inv_type, pdf_url, updated_at) + _ref_vals() + (invoice_id,),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE invoices SET customer_phone=?, date=?, total=?, "
-                            f"paid=?, balance=?, type=?, pdf_url=?"
-                            f"{', reference_phone=?' if has_ref else ''} WHERE id=?",
-                            (customer_phone, date, total, paid, balance,
-                             inv_type, pdf_url) + _ref_vals() + (invoice_id,),
-                        )
+                        sets.append("updated_at=?"); vals.append(updated_at)
+                    if has_ref:
+                        sets.append("reference_phone=?"); vals.append(reference_phone)
+                    if has_cid:
+                        sets.append("cloud_id=?"); vals.append(cloud_id)
+                    vals.append(existing["id"])
+                    conn.execute(
+                        f"UPDATE invoices SET {', '.join(sets)} WHERE id=?",
+                        tuple(vals),
+                    )
             conn.commit()
         finally:
             conn.close()
@@ -260,9 +277,8 @@ def _upsert_invoice_item(row: dict) -> None:
     so items survive even when product_id can't be resolved.
     """
     from database import get_conn, _write_lock
-    try:
-        invoice_id = int(row.get("invoice_id"))
-    except (TypeError, ValueError):
+    parent_cid = str(row.get("invoice_id") or "").strip()
+    if not parent_cid:
         return
     product_name = row.get("product_name") or ""
     qty    = float(row.get("qty") or 0)
@@ -278,6 +294,21 @@ def _upsert_invoice_item(row: dict) -> None:
         try:
             has_ua    = _has_column(conn, "invoice_items", "updated_at")
             has_pname = _has_column(conn, "invoice_items", "product_name")
+            has_cid   = _has_column(conn, "invoices", "cloud_id")
+
+            # Resolve the parent invoice's LOCAL integer id from its cloud_id.
+            inv_row = None
+            if has_cid:
+                inv_row = conn.execute(
+                    "SELECT id FROM invoices WHERE cloud_id=?", (parent_cid,)
+                ).fetchone()
+            if inv_row is None and parent_cid.isdigit():
+                inv_row = conn.execute(
+                    "SELECT id FROM invoices WHERE id=?", (int(parent_cid),)
+                ).fetchone()
+            if inv_row is None:
+                return  # parent invoice not local yet; next pull cycle catches it
+            invoice_id = inv_row["id"]
 
             # Resolve product_id (case-insensitive); 0 if not found — OK
             pid_row = conn.execute(
@@ -348,10 +379,12 @@ def _upsert_invoice_item(row: dict) -> None:
 
 
 def _upsert_payment(row: dict) -> None:
+    """Insert/update a payment keyed on the global text cloud_id. Payments from
+    the other PC or phone are inserted with a fresh local id and the cloud_id
+    remembered, so none are ever dropped or overwritten."""
     from database import get_conn, _write_lock
-    try:
-        pay_id = int(row.get("id"))
-    except (TypeError, ValueError):
+    cloud_id = str(row.get("id") or "").strip()
+    if not cloud_id:
         return
     updated_at = row.get("updated_at") or _now_iso()
     phone  = row.get("customer_phone") or ""
@@ -361,52 +394,49 @@ def _upsert_payment(row: dict) -> None:
     with _write_lock:
         conn = get_conn()
         try:
-            has_ua = _has_column(conn, "payments", "updated_at")
-            if has_ua:
+            has_ua  = _has_column(conn, "payments", "updated_at")
+            has_cid = _has_column(conn, "payments", "cloud_id")
+
+            existing = None
+            if has_cid:
                 existing = conn.execute(
-                    "SELECT updated_at FROM payments WHERE id=?", (pay_id,)
+                    "SELECT id, updated_at FROM payments WHERE cloud_id=?", (cloud_id,)
                 ).fetchone()
-            else:
+            if existing is None and cloud_id.isdigit():
                 existing = conn.execute(
-                    "SELECT id FROM payments WHERE id=?", (pay_id,)
+                    "SELECT id, updated_at FROM payments WHERE id=?", (int(cloud_id),)
                 ).fetchone()
 
             if existing is None:
+                cols = ["customer_phone", "amount", "date"]
+                vals = [phone, amount, date]
                 if has_ua:
-                    conn.execute(
-                        "INSERT INTO payments (id, customer_phone, amount, date, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (pay_id, phone, amount, date, updated_at),
-                    )
-                else:
-                    conn.execute(
-                        "INSERT INTO payments (id, customer_phone, amount, date) "
-                        "VALUES (?, ?, ?, ?)",
-                        (pay_id, phone, amount, date),
-                    )
+                    cols.append("updated_at"); vals.append(updated_at)
+                if has_cid:
+                    cols.append("cloud_id"); vals.append(cloud_id)
+                ph = ", ".join("?" * len(cols))
+                conn.execute(
+                    f"INSERT INTO payments ({', '.join(cols)}) VALUES ({ph})",
+                    tuple(vals),
+                )
             else:
-                local_ua = existing["updated_at"] if has_ua else ""
-                if (local_ua or "") < updated_at:
+                local_ua = (existing["updated_at"] if has_ua else "") or ""
+                if local_ua < updated_at:
+                    sets = ["customer_phone=?", "amount=?", "date=?"]
+                    vals = [phone, amount, date]
                     if has_ua:
-                        conn.execute(
-                            "UPDATE payments SET customer_phone=?, amount=?, date=?, "
-                            "updated_at=? WHERE id=?",
-                            (phone, amount, date, updated_at, pay_id),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE payments SET customer_phone=?, amount=?, date=? "
-                            "WHERE id=?",
-                            (phone, amount, date, pay_id),
-                        )
+                        sets.append("updated_at=?"); vals.append(updated_at)
+                    if has_cid:
+                        sets.append("cloud_id=?"); vals.append(cloud_id)
+                    vals.append(existing["id"])
+                    conn.execute(
+                        f"UPDATE payments SET {', '.join(sets)} WHERE id=?",
+                        tuple(vals),
+                    )
             conn.commit()
         finally:
             conn.close()
 
-
-# ════════════════════════════════════════════════════════════
-# TABLE PULL FUNCTIONS
-# ════════════════════════════════════════════════════════════
 
 def _pull_table(table: str, upsert_fn, state: dict) -> int:
     """Pull rows from `table` updated since the saved marker.

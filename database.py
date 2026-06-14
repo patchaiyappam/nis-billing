@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
-from config import DB_PATH
+from config import DB_PATH, DEVICE_ID
 from logger import get_logger
 
 log = get_logger(__name__)
@@ -424,8 +424,11 @@ def delete_invoice(invoice_id: int) -> bool:
     with _write_lock:
         conn = get_conn()
         try:
+            has_cid = any(r[1] == "cloud_id"
+                          for r in conn.execute("PRAGMA table_info(invoices)"))
+            cols = "customer_phone, balance, type" + (", cloud_id" if has_cid else "")
             inv = conn.execute(
-                "SELECT customer_phone, balance, type FROM invoices WHERE id=?",
+                f"SELECT {cols} FROM invoices WHERE id=?",
                 (invoice_id,),
             ).fetchone()
             if not inv:
@@ -434,6 +437,8 @@ def delete_invoice(invoice_id: int) -> bool:
             phone   = inv["customer_phone"]
             balance = float(inv["balance"] or 0)
             kind    = (inv["type"] or "invoice").lower()
+            if has_cid and inv["cloud_id"]:
+                cloud_id = inv["cloud_id"]
 
             conn.execute("DELETE FROM invoice_items WHERE invoice_id=?", (invoice_id,))
             conn.execute("DELETE FROM invoices      WHERE id=?",         (invoice_id,))
@@ -454,9 +459,9 @@ def delete_invoice(invoice_id: int) -> bool:
         finally:
             conn.close()
 
-    # Push delete to cloud so pull doesn't resurrect
-    _cloud_delete("invoice_items", "invoice_id", invoice_id)
-    _cloud_delete("invoices",      "id",         invoice_id)
+    # Push delete to cloud so pull doesn't resurrect (key by cloud_id)
+    _cloud_delete("invoice_items", "invoice_id", cloud_id)
+    _cloud_delete("invoices",      "id",         cloud_id)
     return True
 
 
@@ -513,8 +518,11 @@ def delete_payment(payment_id: int) -> bool:
     with _write_lock:
         conn = get_conn()
         try:
+            has_cid = any(r[1] == "cloud_id"
+                          for r in conn.execute("PRAGMA table_info(payments)"))
+            cols = "customer_phone, amount" + (", cloud_id" if has_cid else "")
             pay = conn.execute(
-                "SELECT customer_phone, amount FROM payments WHERE id=?",
+                f"SELECT {cols} FROM payments WHERE id=?",
                 (payment_id,),
             ).fetchone()
             if not pay:
@@ -522,6 +530,8 @@ def delete_payment(payment_id: int) -> bool:
                 return False
             phone  = pay["customer_phone"]
             amount = float(pay["amount"] or 0)
+            if has_cid and pay["cloud_id"]:
+                cloud_id = pay["cloud_id"]
 
             conn.execute("DELETE FROM payments WHERE id=?", (payment_id,))
             conn.execute(
@@ -538,7 +548,7 @@ def delete_payment(payment_id: int) -> bool:
         finally:
             conn.close()
 
-    _cloud_delete("payments", "id", payment_id)
+    _cloud_delete("payments", "id", cloud_id)
     return True
 
 
@@ -619,6 +629,12 @@ def create_invoice(customer_phone, total, paid, balance, items,
                              VALUES (?, ?, ?, ?, ?, ?, ?)""",
                           (customer_phone, now, total, paid, balance, type, ref))
             invoice_id = c.lastrowid
+
+            # Assign a globally-unique cloud id (device-tagged) so this bill
+            # can never collide with one created on another PC/phone.
+            if "cloud_id" in inv_cols:
+                c.execute("UPDATE invoices SET cloud_id=? WHERE id=?",
+                          (f"{DEVICE_ID}-{invoice_id}", invoice_id))
 
             # Check if product_name column exists (migration 14)
             has_pname = any(
@@ -799,6 +815,27 @@ def get_invoices_by_reference(reference_phone: str) -> list:
     return [dict(r) for r in rows]
 
 
+def get_reference_pending_totals():
+    """Each referrer with the total still-unpaid balance from sales they
+    referred (real invoices with balance > 0). Powers the dashboard
+    'Reference Pending' panel."""
+    rows = _execute_read("""
+        SELECT i.reference_phone AS ref_phone,
+               COALESCE(c.name, i.reference_phone) AS ref_name,
+               COUNT(*) AS bills,
+               COALESCE(SUM(i.balance), 0) AS pending
+        FROM invoices i
+        LEFT JOIN customers c ON c.phone = i.reference_phone
+        WHERE i.reference_phone IS NOT NULL
+          AND TRIM(i.reference_phone) <> ''
+          AND LOWER(i.type) = 'invoice'
+          AND i.balance > 0
+        GROUP BY i.reference_phone
+        ORDER BY pending DESC
+    """)
+    return [dict(r) for r in rows]
+
+
 def get_invoices_by_phone(phone):
     rows = _execute_read(
         "SELECT * FROM invoices WHERE customer_phone = ? ORDER BY date DESC",
@@ -842,6 +879,10 @@ def create_payment(customer_phone, amount):
             c.execute("INSERT INTO payments (customer_phone, amount, date) VALUES (?, ?, ?)",
                       (customer_phone, amount, now))
             payment_id = c.lastrowid
+
+            if any(r[1] == "cloud_id" for r in conn.execute("PRAGMA table_info(payments)")):
+                c.execute("UPDATE payments SET cloud_id=? WHERE id=?",
+                          (f"{DEVICE_ID}-{payment_id}", payment_id))
 
             # Reduce customer total_due (clamped to 0)
             c.execute(
@@ -892,6 +933,9 @@ def nil_customer_balance(customer_phone: str):
                 "INSERT INTO payments (customer_phone, amount, date) VALUES (?, ?, ?)",
                 (customer_phone, current_due, note_date))
             payment_id = c.lastrowid
+            if any(r[1] == "cloud_id" for r in conn.execute("PRAGMA table_info(payments)")):
+                c.execute("UPDATE payments SET cloud_id=? WHERE id=?",
+                          (f"{DEVICE_ID}-{payment_id}", payment_id))
             c.execute(
                 "UPDATE customers SET total_due = 0 WHERE phone = ?",
                 (customer_phone,))

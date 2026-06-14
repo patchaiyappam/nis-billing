@@ -186,9 +186,12 @@ def sync_invoice(
     try:
         from datetime import datetime, timezone
         now_iso = datetime.now(timezone.utc).isoformat()
+        # Use the device-unique cloud_id as the cloud primary key so two
+        # PCs/phone can never overwrite each other's bills.
+        cloud_id = str(invoice.get("cloud_id") or invoice_id)
         client.table("invoices").upsert(
             {
-                "id":              str(invoice_id),
+                "id":              cloud_id,
                 "customer_phone":  invoice.get("customer_phone", ""),
                 "customer_name":   invoice.get("customer_name", ""),
                 "total":           float(invoice.get("total", 0)),
@@ -206,7 +209,7 @@ def sync_invoice(
         for item in items:
             client.table("invoice_items").upsert(
                 {
-                    "invoice_id":   str(invoice_id),
+                    "invoice_id":   cloud_id,
                     "product_name": item.get("product_name", ""),
                     "qty":          float(item.get("qty", 0)),
                     "price":        float(item.get("price", 0)),
@@ -247,7 +250,7 @@ def sync_payment(payment: dict) -> bool:
         now_iso = datetime.now(timezone.utc).isoformat()
         client.table("payments").upsert(
             {
-                "id":             str(payment.get("id", "")),
+                "id":             str(payment.get("cloud_id") or payment.get("id", "")),
                 "customer_phone": payment.get("customer_phone", ""),
                 "amount":         float(payment.get("amount", 0)),
                 "date":           payment.get("date", ""),
@@ -290,7 +293,9 @@ def sync_product(product: dict) -> bool:
                 "name":       product.get("name", ""),
                 "price":      float(product.get("price", 0)),
                 "unit":       product.get("unit", "Nos"),
-                "updated_at": product.get("updated_at") or now_iso,
+                # Never fabricate NOW() for a product missing a timestamp — that
+                # makes a stale copy look newest and reverts real price edits.
+                "updated_at": product.get("updated_at") or "2000-01-01T00:00:00+00:00",
             },
             on_conflict="id"
         ).execute()

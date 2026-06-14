@@ -212,6 +212,30 @@ class DashboardFrame(tk.Frame):
         self.pay_tree.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=(0, 14))
         psb.pack(side="right", fill="y", pady=(0, 14), padx=(0, 8))
 
+        # ── Reference Pending section ─────────────────────
+        tk.Label(
+            self.inner, text="🤝  Reference Pending  (referrers with unpaid referred sales)",
+            font=FONTS["subheading"], bg=COLORS["content_bg"],
+            fg=COLORS["text_muted"],
+        ).pack(anchor="w", padx=24, pady=(24, 8))
+
+        ref_card = _card(self.inner)
+        ref_card.pack(fill="x", padx=24, pady=(0, 4))
+        ref_cols = ("ref_name", "ref_phone", "bills", "pending")
+        self.ref_tree = ttk.Treeview(ref_card, columns=ref_cols, show="headings", height=6)
+        for col, hd, w, anch in [
+            ("ref_name",  "Referrer",   210, "w"),
+            ("ref_phone", "Phone",      140, "center"),
+            ("bills",     "Bills",       70, "center"),
+            ("pending",   "Pending",    120, "e"),
+        ]:
+            self.ref_tree.heading(col, text=hd)
+            self.ref_tree.column(col, width=w, anchor=anch, stretch=True)
+        rsb = ttk.Scrollbar(ref_card, orient="vertical", command=self.ref_tree.yview)
+        self.ref_tree.configure(yscrollcommand=rsb.set)
+        self.ref_tree.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
+        rsb.pack(side="right", fill="y", pady=12, padx=(0, 8))
+
         # ── Low Stock section ─────────────────────────────
         tk.Label(
             self.inner, text="📦  Low Stock Alert",
@@ -235,6 +259,7 @@ class DashboardFrame(tk.Frame):
             self._refresh_cards()
             self._refresh_recent_invoices()
             self._refresh_recent_payments()
+            self._refresh_reference()
             self._refresh_low_stock()
         except Exception as e:
             log.error("Dashboard refresh error: %s", e, exc_info=True)
@@ -299,6 +324,20 @@ class DashboardFrame(tk.Frame):
                 ))
         except Exception as e:
             log.error("Recent payments refresh error: %s", e, exc_info=True)
+
+    def _refresh_reference(self):
+        """Populate the reference-pending table: referrers + unpaid total."""
+        self.ref_tree.delete(*self.ref_tree.get_children())
+        try:
+            for r in db.get_reference_pending_totals():
+                self.ref_tree.insert("", "end", values=(
+                    (r.get("ref_name") or "")[:26],
+                    r.get("ref_phone", ""),
+                    r.get("bills", 0),
+                    f"₹{(r.get('pending') or 0):,.0f}",
+                ))
+        except Exception as e:
+            log.error("Reference pending refresh error: %s", e, exc_info=True)
 
     def _refresh_low_stock(self):
         """Rebuild the low stock product table."""

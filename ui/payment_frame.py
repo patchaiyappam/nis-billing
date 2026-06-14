@@ -6,6 +6,9 @@ from database import get_customer, create_payment, get_payments_by_phone, get_al
 from whatsapp import send_payment_message
 from task_queue import add_task
 import database as db
+from logger import get_logger
+
+log = get_logger(__name__)
 
 
 def _card(parent):
@@ -295,17 +298,52 @@ class PaymentFrame(tk.Frame):
         except Exception:
             pass
 
+        self._emit_receipt(c["name"], phone, amount, remaining, payment_id)
         messagebox.showinfo("Payment Recorded",
             f"Amount: \u20b9{amount:,.2f}\nRemaining: \u20b9{remaining:,.2f}")
-        try:
-            send_payment_message(phone, c["name"], amount, remaining)
-        except Exception:
-            pass
+        if self._wa_auto_ok():
+            try:
+                send_payment_message(phone, c["name"], amount, remaining)
+            except Exception:
+                pass
         self.amount_var.set("")
         # Refresh display
         updated = get_customer(phone)
         if updated:
             self._load_customer(updated)
+
+    def _wa_auto_ok(self):
+        try:
+            from config import WA_AUTO_SEND, WA_METHOD
+            return bool(WA_AUTO_SEND) and str(WA_METHOD).lower() in ("meta", "twilio")
+        except Exception:
+            return False
+
+    def _emit_receipt(self, name, phone, amount, balance_after, payment_id):
+        """Generate a payment receipt PDF, print it, and open it for sharing."""
+        try:
+            from pdf_generator import generate_payment_receipt_pdf
+            path = generate_payment_receipt_pdf(payment_id, name, phone,
+                                                float(amount), float(balance_after))
+        except Exception as e:
+            log.error("Receipt generation failed: %s", e)
+            return
+        if not path:
+            return
+        import os, sys, subprocess
+        try:
+            if sys.platform == "win32":
+                try:
+                    os.startfile(path, "print")
+                except Exception:
+                    pass
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path])
+            else:
+                subprocess.run(["xdg-open", path])
+        except Exception as e:
+            log.warning("Receipt print/open failed: %s", e)
 
     def _nil_balance(self):
         """Zero out the customer's entire outstanding balance (write-off)."""
@@ -334,7 +372,8 @@ class PaymentFrame(tk.Frame):
         ):
             return
         try:
-            payment_id, wiped = db.nil_customer_balance(phone)
+            payment_id = db.create_payment(phone, float(due))
+            wiped = float(due)
             try:
                 if payment_id:
                     add_task("cloud_sync", {"phone": phone, "payment_id": payment_id})
@@ -343,8 +382,9 @@ class PaymentFrame(tk.Frame):
         except Exception as e:
             messagebox.showerror("NIL Balance Failed", str(e))
             return
+        self._emit_receipt(c["name"], phone, wiped, 0.0, payment_id)
         messagebox.showinfo("NIL Balance Done",
-            f"\u2705 \u20b9{wiped:,.2f} wiped for {c['name']}.\n"
+            f"\u2705 \u20b9{wiped:,.2f} recorded as paid for {c['name']}.\n"
             f"Balance is now \u20b90.00.")
         # Refresh display
         updated = get_customer(phone)

@@ -109,6 +109,15 @@ class ShopApp(tk.Tk):
         tk.Frame(self.sidebar, bg=COLORS["divider"],
                  height=1).pack(fill="x", padx=16, pady=6)
 
+        tk.Button(
+            self.sidebar, text="🔄  UPDATE APP",
+            font=("Segoe UI", 13, "bold"),
+            bg="#1E3A5F", fg="#FFFFFF",
+            relief="flat", pady=10, cursor="hand2",
+            activeforeground="#FFFFFF", activebackground="#27496D",
+            command=self._update_app,
+        ).pack(fill="x", padx=12, pady=(2, 8))
+
         # Sync status
         self.status_var = tk.StringVar(value="📴  Offline")
         tk.Label(self.sidebar, textvariable=self.status_var,
@@ -273,6 +282,14 @@ class ShopApp(tk.Tk):
         except Exception as e:
             log.warning("Sync start failed: %s", e)
             self.status_var.set("📴  Offline")
+
+    def _update_app(self):
+        try:
+            from updater import run_update
+            run_update(self, self.status_var.set)
+        except Exception as e:
+            log.error("Update failed to start: %s", e)
+            messagebox.showerror("Update", f"Could not start the update:\n{e}")
 
     # ── Close ─────────────────────────────────────────────
     def _on_closing(self):

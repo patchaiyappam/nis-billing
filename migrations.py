@@ -78,6 +78,18 @@ MIGRATIONS = [
     (16, "Add payment_type to invoices (Cash/UPI/Credit/Cheque)", [
         "ALTER TABLE invoices ADD COLUMN payment_type TEXT DEFAULT 'Cash'",
     ]),
+    (17, "Add cloud_id to invoices & payments for collision-free sync", [
+        "ALTER TABLE invoices ADD COLUMN cloud_id TEXT",
+        "ALTER TABLE payments ADD COLUMN cloud_id TEXT",
+        "UPDATE invoices SET cloud_id = CAST(id AS TEXT) "
+        "WHERE cloud_id IS NULL OR cloud_id = ''",
+        "UPDATE payments SET cloud_id = CAST(id AS TEXT) "
+        "WHERE cloud_id IS NULL OR cloud_id = ''",
+    ]),
+    (18, "Backfill NULL product updated_at so price edits aren't reverted", [
+        "UPDATE products SET updated_at = '2000-01-01T00:00:00+00:00' "
+        "WHERE updated_at IS NULL OR updated_at = ''",
+    ]),
 ]
 
 

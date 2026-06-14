@@ -483,3 +483,92 @@ def generate_customer_statement_pdf(customer_name, customer_phone,
     doc.build(elements)
     log.info("Statement PDF generated: %s", filepath)
     return filepath
+
+
+def generate_payment_receipt_pdf(payment_id, customer_name, customer_phone,
+                                 amount, balance_after, date_str=None,
+                                 mode="Cash"):
+    """A5 payment receipt PDF (matches the bill style). Returns path or None."""
+    if not REPORTLAB_AVAILABLE:
+        log.error("Receipt PDF skipped - reportlab not installed.")
+        return None
+    os.makedirs(INVOICES_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"RECEIPT-{payment_id}_{stamp}.pdf"
+    filepath = os.path.join(INVOICES_DIR, filename)
+    when = date_str or datetime.now().strftime("%d-%m-%Y  %I:%M %p")
+
+    doc = SimpleDocTemplate(filepath, pagesize=BILL_PAGESIZE,
+                            topMargin=6*mm, bottomMargin=6*mm,
+                            leftMargin=8*mm, rightMargin=8*mm)
+    W = doc.width
+    el = []
+
+    logo_cell = ""
+    if os.path.exists(LOGO_PATH):
+        try:
+            logo_cell = RLImage(LOGO_PATH, width=32*mm, height=32*mm)
+        except Exception:
+            logo_cell = Paragraph(f"<b>{SHOP_NAME}</b>", _ps("ln", 14, True, color=NAVY))
+    shop_info = Paragraph(
+        f"<font size='9' color='#6C7A89'>{SHOP_ADDRESS}</font><br/>"
+        f"<font size='9' color='#6C7A89'>Ph: {SHOP_PHONE}</font>",
+        _ps("si", 9, False, TA_LEFT, BLACK, leading=12))
+    title = Paragraph("<b>RECEIPT</b>", _ps("rt", 20, True, TA_RIGHT, NAVY, leading=22))
+    hdr = Table([[logo_cell, shop_info, title]],
+                colWidths=[34*mm, W - 34*mm - 40*mm, 40*mm])
+    hdr.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                             ('LEFTPADDING', (0,0), (-1,-1), 0),
+                             ('RIGHTPADDING', (0,0), (-1,-1), 0)]))
+    el.append(hdr)
+    el.append(Spacer(1, 4*mm))
+    el.append(HRFlowable(width="100%", thickness=1, color=NAVY))
+    el.append(Spacer(1, 3*mm))
+
+    meta = Table([[Paragraph(f"<b>RECEIPT NO:</b> {payment_id}", _ps("m1", 10)),
+                   Paragraph(f"<b>DATE:</b> {when}", _ps("m2", 10, align=TA_RIGHT))]],
+                 colWidths=[W*0.5, W*0.5])
+    meta.setStyle(TableStyle([('LEFTPADDING', (0,0), (-1,-1), 0),
+                              ('RIGHTPADDING', (0,0), (-1,-1), 0)]))
+    el.append(meta)
+    el.append(Spacer(1, 2*mm))
+    el.append(Paragraph(
+        f"<b>Received with thanks from:</b> "
+        f"<font color='#1B3A6B'><b>{customer_name}</b></font> "
+        f"&nbsp;<font size='9' color='#6C7A89'>Ph: {customer_phone}</font>",
+        _ps("rf", 11, leading=15)))
+    el.append(Spacer(1, 4*mm))
+
+    data = [["Payment Mode", mode],
+            ["Amount Received", f"Rs. {amount:,.2f}"],
+            ["Balance After Payment", f"Rs. {balance_after:,.2f}"]]
+    t = Table(data, colWidths=[W*0.5, W*0.5])
+    t.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 0.5, MGREY),
+        ('FONTSIZE', (0,0), (-1,-1), 11),
+        ('TOPPADDING', (0,0), (-1,-1), 7),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+        ('LEFTPADDING', (0,0), (-1,-1), 8),
+        ('BACKGROUND', (0,1), (-1,1), colors.HexColor('#EAFAF1')),
+        ('FONTNAME', (0,1), (-1,1), 'Helvetica-Bold'),
+        ('TEXTCOLOR', (1,1), (1,1), colors.HexColor('#1E8449')),
+        ('FONTSIZE', (0,1), (-1,1), 13),
+    ]))
+    el.append(t)
+    el.append(Spacer(1, 10*mm))
+    el.append(Paragraph("Authorised Signature: ____________________",
+                        _ps("sg", 10, align=TA_RIGHT)))
+    el.append(Spacer(1, 6*mm))
+    el.append(HRFlowable(width="100%", thickness=0.5, color=MGREY))
+    el.append(Spacer(1, 2*mm))
+    el.append(Paragraph(
+        f"Thank you! &nbsp;|&nbsp; {SHOP_NAME} &nbsp;|&nbsp; {SHOP_PHONE}",
+        _ps("ft", 8, align=TA_CENTER, color=GREY)))
+
+    try:
+        doc.build(el)
+        log.info("Receipt PDF generated: %s", filename)
+        return filepath
+    except Exception as e:
+        log.error("Receipt PDF build failed: %s", e, exc_info=True)
+        return None
